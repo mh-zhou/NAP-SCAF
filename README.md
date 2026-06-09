@@ -5,7 +5,7 @@
 This repository provides a clean PyTorch implementation of **NAP-SCAF**, a similarity-aware calibration framework for multi-modal brain tumor segmentation. The implementation focuses on the core method used in the paper: a non-local adaptive prior branch, local normalized cross-correlation based skip calibration, and contrast-enhanced region attention.
 
 NAP-SCAF is designed for challenging multi-modal MRI segmentation scenarios where the input modalities may be incomplete, local lesion boundaries are weak, and naïve U-shaped skip fusion can propagate semantically inconsistent encoder features into the decoder.
-![Overview of the proposed NAP-SCAF framework](./method_overview.jpg)
+![Overview of NAP-SCAF](./method.jpg)
 ## Highlights
 
 - **Non-local Adaptive Prior (NAP)**  
@@ -242,9 +242,6 @@ gates = output["gates"]
 4. For missing-modality testing, zero-fill absent modalities and keep the same checkpoint.
 5. HD95 is sensitive to empty predictions. This implementation returns `nan` for one-sided empty masks and averages with `nanmean`.
 
-## Cleaned codebase policy
-
-This GitHub version intentionally removes temporary files from the original research workspace, including local CSV result dumps, Visio drafts, one-off Grad-CAM experiments, old baseline scripts, duplicate ablation scripts, and machine-specific Windows paths. The retained code is organized around a reproducible pipeline: preprocessing, model construction, training, evaluation, and inference.
 
 ## Citation
 
