@@ -26,15 +26,10 @@ def parse_args():
     parser.add_argument("--weight-decay", default=1e-4, type=float)
     parser.add_argument("--val-ratio", default=0.2, type=float)
     parser.add_argument("--seed", default=7, type=int)
-    parser.add_argument("--base-channels", default=16, type=int)
+    parser.add_argument("--mid-channels", default=16, type=int)
     parser.add_argument("--stages", default=4, type=int)
-    parser.add_argument("--latent-channels", default=1024, type=int)
-    parser.add_argument("--ncc-window", default=5, type=int)
     parser.add_argument("--num-workers", default=4, type=int)
     parser.add_argument("--amp", action="store_true", help="Use automatic mixed precision.")
-    parser.add_argument("--use-nap-loss", action="store_true", help="Add reconstruction and KL losses from NAP branch.")
-    parser.add_argument("--rec-weight", default=0.05, type=float)
-    parser.add_argument("--kl-weight", default=1e-4, type=float)
     return parser.parse_args()
 
 
@@ -82,10 +77,8 @@ def main():
     model = build_nap_scaf(
         in_channels=4,
         num_classes=4,
-        base_channels=args.base_channels,
+        mid_channels=args.mid_channels,
         stages=args.stages,
-        latent_channels=args.latent_channels,
-        ncc_window=args.ncc_window,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
@@ -103,14 +96,11 @@ def main():
             target = target.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=args.amp):
-                output = model(image, return_aux=args.use_nap_loss)
+                output = model(image)
                 loss = total_nap_scaf_loss(
                     output,
                     target,
-                    image=image if args.use_nap_loss else None,
                     num_classes=4,
-                    rec_weight=args.rec_weight,
-                    kl_weight=args.kl_weight,
                 )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
