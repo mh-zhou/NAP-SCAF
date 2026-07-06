@@ -1,3 +1,3 @@
-from .nap_scaf import NAPSCAF, NAPSCAFConfig, build_nap_scaf
+from .nap_scaf import  NAP_SCAF, NAPSCAFConfig, build_nap_scaf
 
-__all__ = ["NAPSCAF", "NAPSCAFConfig", "build_nap_scaf"]
+__all__ = [" NAP_SCAF", "NAPSCAFConfig", "build_nap_scaf"]
