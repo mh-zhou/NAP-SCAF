@@ -2,7 +2,7 @@
 
 **Similarity-aware feature calibration stabilizes low-contrast and missing-modality brain segmentation**
 
-This repository provides a clean PyTorch implementation of **NAP-SCAF**, a similarity-aware calibration framework for multi-modal brain tumor segmentation. The implementation focuses on the core method used in the paper: a non-local adaptive prior branch, local normalized cross-correlation based skip calibration, and contrast-enhanced region attention.
+This repository provides the original PyTorch implementation of **NAP-SCAF**, a similarity-aware calibration framework for multi-modal brain tumor segmentation. The implementation follows the paper version with a DenseNet121-based variational prior branch, similarity-weighted skip calibration, and contrast-enhanced residual attention.
 
 NAP-SCAF is designed for challenging multi-modal MRI segmentation scenarios where the input modalities may be incomplete, local lesion boundaries are weak, and naïve U-shaped skip fusion can propagate semantically inconsistent encoder features into the decoder.
 ![Overview of NAP-SCAF](./method.jpg)
@@ -20,16 +20,20 @@ NAP-SCAF is designed for challenging multi-modal MRI segmentation scenarios wher
 - **Missing-modality evaluation support**  
   Any subset of input modalities can be zero-filled at test time without changing the model weights.
 
+## Model complexity
+
+The paper configuration uses `NAP_SCAF(inc=4, outc=4, midc=16, stages=4)` with a `1 x 4 x 256 x 256` input. Under this setting, the reported model complexity is **58.3M parameters** and **47.3 GFLOPs**. The parameter count excludes the unused DenseNet121 classifier because the forward pass uses only `DenseNet121.features` followed by the NAP-SCAF variational projection.
+
 ## Repository structure
 
 ```text
-NAP_SCAF_clean/
+NAP-SCAF-main/
 ├── nap_scaf/
 │   ├── models/
 │   │   └── nap_scaf.py          # NAP-SCAF model, NAP, SWG, CERA
 │   ├── data/
 │   │   └── brats_png.py         # BraTS PNG slice dataset
-│   ├── losses.py                # Dice, CE, reconstruction, and KL losses
+│   ├── losses.py                # Dice and CE losses
 │   ├── metrics.py               # WT, TC, ET Dice and HD95 metrics
 │   └── utils.py                 # checkpoint, seed, JSON utilities
 ├── scripts/
@@ -132,17 +136,9 @@ python scripts/train_brats.py \
   --batch-size 16 \
   --val-batch-size 4 \
   --lr 1e-4 \
-  --base-channels 16 \
+  --mid-channels 16 \
   --stages 4 \
-  --latent-channels 1024 \
-  --ncc-window 5 \
   --amp
-```
-
-To include the variational reconstruction and KL terms from the NAP branch, add:
-
-```bash
---use-nap-loss --rec-weight 0.05 --kl-weight 1e-4
 ```
 
 The script saves:
@@ -214,24 +210,13 @@ from nap_scaf import build_nap_scaf
 model = build_nap_scaf(
     in_channels=4,
     num_classes=4,
-    base_channels=16,
+    mid_channels=16,
     stages=4,
-    latent_channels=1024,
-    ncc_window=5,
 )
 
 x = torch.randn(2, 4, 256, 256)
 logits = model(x)
 print(logits.shape)  # (2, 4, 256, 256)
-```
-
-To access the NAP reconstruction and gate maps during training or visualization:
-
-```python
-output = model(x, return_aux=True)
-logits = output["logits"]
-reconstruction = output["reconstruction"]
-gates = output["gates"]
 ```
 
 ## Reproducibility notes
