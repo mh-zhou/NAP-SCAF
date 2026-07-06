@@ -20,10 +20,8 @@ def parse_args():
     parser.add_argument("--output", default="results/eval_metrics.json", type=str)
     parser.add_argument("--image-size", default=256, type=int)
     parser.add_argument("--batch-size", default=4, type=int)
-    parser.add_argument("--base-channels", default=16, type=int)
+    parser.add_argument("--mid-channels", default=16, type=int)
     parser.add_argument("--stages", default=4, type=int)
-    parser.add_argument("--latent-channels", default=1024, type=int)
-    parser.add_argument("--ncc-window", default=5, type=int)
     parser.add_argument("--missing-modalities", default="", type=str, help="Comma-separated modalities to zero-fill, e.g. t1,t2.")
     parser.add_argument("--num-workers", default=4, type=int)
     return parser.parse_args()
@@ -40,10 +38,8 @@ def main():
     model = build_nap_scaf(
         in_channels=4,
         num_classes=4,
-        base_channels=args.base_channels,
+        mid_channels=args.mid_channels,
         stages=args.stages,
-        latent_channels=args.latent_channels,
-        ncc_window=args.ncc_window,
     ).to(device)
     load_checkpoint(args.checkpoint, model, map_location=device)
     model.eval()
