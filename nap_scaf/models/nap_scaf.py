@@ -281,6 +281,10 @@ class NAP_SCAF(nn.Module):
                 fea, _ = self.gates[i](gfeat, fea)
             outs.append(self.convouts[i](fea))
         return outs[-1]
+
+def build_nap_scaf(in_channels=4, num_classes=4, mid_channels=16, stages=4, gate_passes=2):
+    return NAP_SCAF(inc=in_channels, outc=num_classes, midc=mid_channels, stages=stages, gate_passes=gate_passes)
+
 if __name__ == '__main__':
     input_channels = 4
     output_channels = 4
