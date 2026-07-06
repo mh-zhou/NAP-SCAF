@@ -30,9 +30,8 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True, type=str)
     parser.add_argument("--output", default="results/prediction.png", type=str)
     parser.add_argument("--image-size", default=256, type=int)
-    parser.add_argument("--base-channels", default=16, type=int)
+    parser.add_argument("--mid-channels", default=16, type=int)
     parser.add_argument("--stages", default=4, type=int)
-    parser.add_argument("--latent-channels", default=1024, type=int)
     return parser.parse_args()
 
 
@@ -44,9 +43,10 @@ def main():
     image = torch.from_numpy(np.stack(channels, axis=0)).unsqueeze(0).float().to(device)
 
     model = build_nap_scaf(
-        base_channels=args.base_channels,
+        in_channels=4,
+        num_classes=4,
+        mid_channels=args.mid_channels,
         stages=args.stages,
-        latent_channels=args.latent_channels,
     ).to(device)
     load_checkpoint(args.checkpoint, model, map_location=device)
     model.eval()
