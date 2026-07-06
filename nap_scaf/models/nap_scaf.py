@@ -1,481 +1,294 @@
-"""NAP-SCAF model.
-
-Similarity-Aware Feature Calibration for low-contrast and missing-modality
-brain tumor segmentation.
-
-Core modules:
-    - NAP: Non-local Adaptive Prior via variational reconstruction.
-    - CERA: Contrast-Enhanced Region Attention.
-    - SWG: Similarity-Weighted Gating based on local normalized
-      cross-correlation.
-
-Input shape:  (B, 4, H, W), modalities ordered as FLAIR, T1, T1ce, T2.
-Output shape: (B, num_classes, H, W), with BraTS labels
-              0 background, 1 NCR/NET, 2 ED, 3 ET.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
-
+import os, sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import densenet121, DenseNet121_Weights
+from torchvision.models.densenet import _DenseBlock
 from einops import rearrange
+sys.path.append(os.path.realpath('..'))
 
-Tensor = torch.Tensor
+class _Transition(nn.Sequential):
 
-
-class ConvBNAct(nn.Sequential):
-    """3x3 convolution followed by BatchNorm and LeakyReLU."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int = 1,
-        kernel_size: int = 3,
-        padding: Optional[int] = None,
-    ) -> None:
-        if padding is None:
-            padding = kernel_size // 2
-        super().__init__(
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-
-
-class VariationalEncoder(nn.Module):
-    """Lightweight convolutional encoder that predicts latent mean and log-variance."""
-
-    def __init__(self, in_channels: int = 4, latent_channels: int = 1024, pretrained: bool = False) -> None:
+    def __init__(self, num_input_features: int, num_output_features: int) -> None:
         super().__init__()
-        # ``pretrained`` is kept for API compatibility. This cleaned implementation
-        # avoids torchvision model downloads and uses a self-contained convolutional VAE.
-        del pretrained
-        widths = (64, 128, 256, 512, latent_channels)
-        layers = []
-        current = in_channels
-        for width in widths:
-            layers.append(ConvBNAct(current, width, stride=2))
-            current = width
-        self.encoder = nn.Sequential(*layers)
-        self.to_mu = nn.Conv2d(latent_channels, latent_channels, kernel_size=3, padding=1)
-        self.to_logvar = nn.Conv2d(latent_channels, latent_channels, kernel_size=3, padding=1)
+        self.add_module('norm', nn.BatchNorm2d(num_input_features))
+        self.add_module('relu', nn.ReLU(inplace=True))
+        self.add_module('conv', nn.Conv2d(num_input_features, num_output_features, kernel_size=1, stride=1, bias=False))
+        self.add_module('pool', nn.Upsample(scale_factor=2.0))
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        feat = self.encoder(x)
-        return self.to_mu(feat), self.to_logvar(feat)
+class Encoder(nn.Module):
 
-
-class VariationalDecoder(nn.Module):
-    """Convolutional decoder that reconstructs the four-modality input."""
-
-    def __init__(self, out_channels: int = 4, latent_channels: int = 1024) -> None:
+    def __init__(self):
         super().__init__()
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(latent_channels, 512, kernel_size=2, stride=2),
-            ConvBNAct(512, 512),
-            nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2),
-            ConvBNAct(256, 256),
-            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
-            ConvBNAct(128, 128),
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
-            ConvBNAct(64, 64),
-            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
-            ConvBNAct(32, 32),
-            nn.Conv2d(32, out_channels, kernel_size=3, padding=1),
-        )
+        num_init_features = 64
+        self.encoder = densenet121(weights=DenseNet121_Weights.DEFAULT)
+        self.encoder.features[0] = nn.Conv2d(4, num_init_features, kernel_size=7, stride=2, padding=3, bias=False)
+        self.fc = nn.Conv2d(1024, 2 * 1024, 3, 1, 1)
 
-    def forward(self, z: Tensor) -> Tensor:
-        return self.decoder(z)
+    def forward(self, x):
+        x = self.encoder.features[0](x)
+        x = self.encoder.features[1](x)
+        x = self.encoder.features[2](x)
+        x = self.encoder.features[3](x)
+        x = self.encoder.features[4](x)
+        x = self.encoder.features[5](x)
+        x = self.encoder.features[6](x)
+        x = self.encoder.features[7](x)
+        x = self.encoder.features[8](x)
+        x = self.encoder.features[9](x)
+        x = self.encoder.features[10](x)
+        x = self.encoder.features[11](x)
+        x = self.fc(x)
+        mu, logvar = x.chunk(2, dim=1)
+        return (mu, logvar)
 
-
-def reparameterize(mu: Tensor, logvar: Tensor) -> Tensor:
-    """Sample a latent tensor using the reparameterization trick."""
-
+def reparameterize(mu, logvar):
+    device = mu.device
     std = torch.exp(0.5 * logvar)
-    eps = torch.randn_like(std)
+    eps = torch.randn_like(std).to(device)
     return mu + eps * std
 
+class Decoder(nn.Module):
 
-class NonLocalAdaptivePrior(nn.Module):
-    """NAP branch producing multi-scale anatomical prior features.
-
-    The branch reconstructs an anatomy-consistent proxy and extracts a decoder-aligned
-    prior pyramid from it. The reconstruction can be supervised by a VAE loss during
-    training by calling ``forward(..., return_aux=True)`` in the main network.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        base_channels: int,
-        stages: int,
-        latent_channels: int = 1024,
-        pretrained_vae_encoder: bool = False,
-        detach_reconstruction: bool = False,
-    ) -> None:
+    def __init__(self, cdim=4, zdim=1024):
         super().__init__()
-        self.stages = stages
-        self.detach_reconstruction = detach_reconstruction
-        self.encoder = VariationalEncoder(in_channels, latent_channels, pretrained_vae_encoder)
-        self.decoder = VariationalDecoder(in_channels, latent_channels)
-        self.input_proj = ConvBNAct(in_channels, base_channels)
+        self.fc = nn.Sequential(nn.Conv2d(zdim, 1024, 3, 1, 1), nn.ReLU(True))
+        self.decoder = nn.Sequential(_Transition(1024, 512), _DenseBlock(num_layers=16, num_input_features=512, bn_size=4, growth_rate=32, drop_rate=0), _Transition(1024, 256), _DenseBlock(num_layers=8, num_input_features=256, bn_size=4, growth_rate=32, drop_rate=0), _Transition(512, 128), _DenseBlock(num_layers=4, num_input_features=128, bn_size=4, growth_rate=32, drop_rate=0), _Transition(256, 64), _DenseBlock(num_layers=2, num_input_features=64, bn_size=4, growth_rate=32, drop_rate=0), _Transition(128, 32), nn.Conv2d(32, cdim, 3, 1, 1))
 
-        enc_layers: List[nn.Module] = []
-        channels = base_channels
-        for _ in range(stages):
-            enc_layers.append(ConvBNAct(channels, channels * 2, stride=2))
-            channels *= 2
-        self.encoders = nn.ModuleList(enc_layers)
+    def forward(self, x):
+        x = self.fc(x)
+        x = self.decoder(x)
+        return x
 
-        dec_layers: List[nn.Module] = []
-        for _ in range(stages):
-            dec_layers.append(
-                nn.ModuleDict(
-                    {
-                        "up": nn.ConvTranspose2d(channels, channels // 2, kernel_size=2, stride=2),
-                        "merge": ConvBNAct(channels, channels // 2),
-                    }
-                )
-            )
-            channels //= 2
-        self.decoders = nn.ModuleList(dec_layers)
+class Conv3x3(nn.Module):
 
-    def forward(self, x: Tensor, return_aux: bool = False) -> Union[List[Tensor], Tuple[List[Tensor], Dict[str, Tensor]]]:
-        mu, logvar = self.encoder(x)
-        z = reparameterize(mu, logvar) if self.training else mu
-        reconstruction = self.decoder(z)
-        if reconstruction.shape[-2:] != x.shape[-2:]:
-            reconstruction = F.interpolate(reconstruction, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        prior_seed = reconstruction.detach() if self.detach_reconstruction else reconstruction
-
-        feats: List[Tensor] = []
-        y = self.input_proj(prior_seed)
-        for layer in self.encoders:
-            y = layer(y)
-            feats.append(y)
-
-        y = feats[-1]
-        prior_pyramid: List[Tensor] = []
-        for i, block in enumerate(self.decoders):
-            y = block["up"](y)
-            if i < len(feats) - 1:
-                skip = feats[-2 - i]
-                if y.shape[-2:] != skip.shape[-2:]:
-                    y = F.interpolate(y, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-                y = block["merge"](torch.cat([y, skip], dim=1))
-            prior_pyramid.append(y)
-
-        if return_aux:
-            return prior_pyramid, {"reconstruction": reconstruction, "mu": mu, "logvar": logvar}
-        return prior_pyramid
-
-
-class ChannelAttention(nn.Module):
-    """Channel attention used in the lightweight transformer block."""
-
-    def __init__(self, dim: int, dim_head: int = 64, heads: int = 8) -> None:
+    def __init__(self, inc, outc, stride):
         super().__init__()
-        self.heads = heads
+        self.conv = nn.Conv2d(inc, outc, 3, stride, 1)
+        self.bn = nn.BatchNorm2d(outc)
+        self.relu = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+class NAP_Path(nn.Module):
+
+    def __init__(self, inc, midc, stages):
+        super().__init__()
+        self.inc, self.stages = (inc, stages)
+        self.vae = nn.ModuleDict({'enc': Encoder(), 'dec': Decoder()})
+        self.inconv = Conv3x3(4, midc, 1)
+        self.enc = nn.ModuleList()
+        stagec = midc
+        for _ in range(stages):
+            self.enc.append(Conv3x3(stagec, stagec * 2, 2))
+            stagec *= 2
+        self.dec = nn.ModuleList()
+        for _ in range(stages):
+            self.dec.append(nn.ModuleList([nn.ConvTranspose2d(stagec, stagec // 2, 2, 2), Conv3x3(stagec, stagec // 2, 1)]))
+            stagec //= 2
+
+    @torch.no_grad()
+    def reconstruct(self, x):
+        mu, logvar = self.vae['enc'](x)
+        z = reparameterize(mu, logvar)
+        rec = self.vae['dec'](z)
+        return rec
+
+    def forward(self, x):
+        rec = self.reconstruct(x)
+        x = self.inconv(rec)
+        enc_feas = []
+        for layer in self.enc:
+            x = layer(x)
+            enc_feas.append(x)
+        fea = enc_feas[-1]
+        dec_feas = []
+        for i, (up, merge) in enumerate(self.dec):
+            fea = up(fea)
+            if i < len(enc_feas) - 1:
+                fea = merge(torch.cat([fea, enc_feas[-2 - i]], 1))
+            dec_feas.append(fea)
+        return dec_feas
+
+class Attention(nn.Module):
+
+    def __init__(self, dim, dim_head=64, heads=8):
+        super().__init__()
+        self.num_heads = heads
         self.dim_head = dim_head
         self.to_q = nn.Linear(dim, dim_head * heads, bias=False)
         self.to_k = nn.Linear(dim, dim_head * heads, bias=False)
         self.to_v = nn.Linear(dim, dim_head * heads, bias=False)
-        self.scale = nn.Parameter(torch.ones(heads, 1, 1))
-        self.proj = nn.Linear(dim_head * heads, dim)
-        self.pos_emb = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
+        self.rescale = nn.Parameter(torch.ones(heads, 1, 1))
+        self.proj = nn.Linear(dim_head * heads, dim, bias=True)
+        self.pos_emb = nn.Conv2d(dim, dim, 3, 1, 1, bias=False, groups=dim)
+        self.dim = dim
 
-    def forward(self, x: Tensor) -> Tensor:
-        b, c, h, w = x.shape
-        tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        q = rearrange(self.to_q(tokens), "b n (h d) -> b h d n", h=self.heads)
-        k = rearrange(self.to_k(tokens), "b n (h d) -> b h d n", h=self.heads)
-        v = rearrange(self.to_v(tokens), "b n (h d) -> b h d n", h=self.heads)
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        attn = (k @ q.transpose(-2, -1)) * self.scale
+    def forward(self, x_in):
+        b, c, h, w = x_in.shape
+        x = x_in.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        q_inp = self.to_q(x)
+        k_inp = self.to_k(x)
+        v_inp = self.to_v(x)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.num_heads), (q_inp, k_inp, v_inp))
+        q = q.transpose(-2, -1)
+        k = k.transpose(-2, -1)
+        v = v.transpose(-2, -1)
+        q = F.normalize(q, dim=-1, p=2)
+        k = F.normalize(k, dim=-1, p=2)
+        attn = k @ q.transpose(-2, -1) * self.rescale
         attn = attn.softmax(dim=-1)
-        out = attn @ v
-        out = out.permute(0, 3, 1, 2).reshape(b, h * w, self.heads * self.dim_head)
-        out = self.proj(out).reshape(b, h, w, c).permute(0, 3, 1, 2)
-        return out + self.pos_emb(x)
-
+        x = attn @ v
+        x = x.permute(0, 3, 1, 2).reshape(b, h * w, self.num_heads * self.dim_head)
+        out_c = self.proj(x).view(b, h, w, c).permute(0, 3, 1, 2)
+        out_p = self.pos_emb(x_in)
+        return out_c + out_p
 
 class FeedForward(nn.Module):
-    """Convolutional feed-forward network."""
 
-    def __init__(self, dim: int, expansion: int = 4) -> None:
+    def __init__(self, dim, mult=4):
         super().__init__()
-        hidden = dim * expansion
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, hidden, kernel_size=1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=False),
-            nn.GELU(),
-            nn.Conv2d(hidden, dim, kernel_size=1, bias=False),
-        )
+        self.net = nn.Sequential(nn.Conv2d(dim, dim * mult, 1, 1, bias=False), nn.GELU(), nn.Conv2d(dim * mult, dim * mult, 3, 1, 1, bias=False, groups=dim * mult), nn.GELU(), nn.Conv2d(dim * mult, dim, 1, 1, bias=False))
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x):
         return self.net(x)
 
+class Transformer(nn.Module):
 
-class FusionTransformer(nn.Module):
-    """Transformer-style fusion block for modality-specific encoder features."""
-
-    def __init__(self, channels: int, dim_head: int, heads: int) -> None:
+    def __init__(self, dim, dim_head=64, heads=8):
         super().__init__()
-        self.attention = ChannelAttention(channels, dim_head=dim_head, heads=heads)
-        self.ffn = FeedForward(channels)
+        self.attn = Attention(dim=dim, dim_head=dim_head, heads=heads)
+        self.ff = FeedForward(dim=dim)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attention(x)
-        x = x + self.ffn(x)
+    def forward(self, x):
+        x = self.attn(x) + x
+        x = self.ff(x) + x
         return x
 
-
 class CERA(nn.Module):
-    """Contrast-Enhanced Region Attention.
 
-    Multi-rate depthwise convolutions capture weak boundary evidence, and a residual
-    attention path reinforces low-contrast transitions without discarding the original
-    feature map.
-    """
-
-    def __init__(self, channels: int) -> None:
+    def __init__(self, in_channels: int):
         super().__init__()
-        self.dilated = nn.ModuleList(
-            [
-                nn.Conv2d(channels, channels, kernel_size=3, padding=d, dilation=d, groups=channels, bias=False)
-                for d in (1, 2, 3)
-            ]
-        )
-        self.fuse = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.Sigmoid(),
-        )
+        self.local1 = nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False)
+        self.local2 = nn.Conv2d(in_channels, in_channels, 3, padding=2, dilation=2, groups=in_channels, bias=False)
+        self.local3 = nn.Conv2d(in_channels, in_channels, 3, padding=3, dilation=3, groups=in_channels, bias=False)
+        self.bg = nn.AvgPool2d(7, stride=1, padding=3)
+        self.fuse = nn.Sequential(nn.Conv2d(in_channels * 4, in_channels, 1, bias=False), nn.BatchNorm2d(in_channels), nn.Sigmoid())
 
-    def forward(self, x: Tensor) -> Tensor:
-        multi = torch.cat([layer(x) for layer in self.dilated], dim=1)
-        attention = self.fuse(multi)
-        return x + x * attention
+    def forward(self, x):
+        b = self.bg(x)
+        c = (x - b).abs()
+        f = torch.cat([self.local1(x), self.local2(x), self.local3(x), c], dim=1)
+        att = self.fuse(f)
+        return x * att + x
 
+class SWG(nn.Module):
 
-class LocalNCCGate(nn.Module):
-    """Similarity-weighted gate using local normalized cross-correlation.
-
-    High structural agreement produces a larger gate value, allowing reliable skip
-    information to pass. Low agreement attenuates the skip transmission.
-    """
-
-    def __init__(self, decoder_channels: int, skip_channels: int, mid_channels: int, window_size: int = 5) -> None:
+    def __init__(self, gch, xch, midc, alpha_init=0.1):
         super().__init__()
-        if window_size % 2 == 0:
-            raise ValueError("window_size must be odd.")
-        self.window_size = window_size
-        self.eps = 1e-6
-        self.q = nn.Conv2d(decoder_channels, mid_channels, kernel_size=1, bias=False)
-        self.k = nn.Conv2d(skip_channels, mid_channels, kernel_size=1, bias=False)
-        self.scale = nn.Parameter(torch.tensor(4.0))
-        self.bias = nn.Parameter(torch.tensor(0.0))
+        self.q = nn.Conv2d(gch, midc, 1, bias=False)
+        self.k = nn.Conv2d(xch, midc, 1, bias=False)
+        init = torch.log(torch.tensor(alpha_init) / (1 - torch.tensor(alpha_init)))
+        self.logit_alpha = nn.Parameter(init.view(1, 1, 1, 1))
 
-    def _local_mean(self, x: Tensor) -> Tensor:
-        return F.avg_pool2d(x, self.window_size, stride=1, padding=self.window_size // 2)
+    def forward(self, g, x):
+        q = F.normalize(self.q(g), dim=1, eps=1e-06)
+        k = F.normalize(self.k(x), dim=1, eps=1e-06)
+        cos_sim = (q * k).sum(dim=1, keepdim=True)
+        sim = (cos_sim + 1.0) * 0.5
+        alpha = torch.sigmoid(self.logit_alpha)
+        w = 1.0 - alpha * sim
+        return x * w
 
-    def forward(self, decoder: Tensor, skip: Tensor) -> Tuple[Tensor, Tensor]:
-        if decoder.shape[-2:] != skip.shape[-2:]:
-            decoder = F.interpolate(decoder, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        q = self.q(decoder)
-        k = self.k(skip)
-        q_centered = q - self._local_mean(q)
-        k_centered = k - self._local_mean(k)
-        numerator = self._local_mean(q_centered * k_centered).sum(dim=1, keepdim=True)
-        q_var = self._local_mean(q_centered.pow(2)).sum(dim=1, keepdim=True)
-        k_var = self._local_mean(k_centered.pow(2)).sum(dim=1, keepdim=True)
-        ncc = numerator / torch.sqrt(q_var * k_var + self.eps)
-        ncc = ncc.clamp(-1.0, 1.0)
-        gate = torch.sigmoid(self.scale * ncc + self.bias)
-        return skip * gate, gate
+class SWC_Gate(nn.Module):
 
-
-class SimilarityCalibrationBlock(nn.Module):
-    """CERA followed by local-NCC similarity-weighted gating."""
-
-    def __init__(self, decoder_channels: int, skip_channels: int, mid_channels: int, window_size: int = 5) -> None:
+    def __init__(self, gch, xch, midc):
         super().__init__()
-        self.cera = CERA(skip_channels)
-        self.swg = LocalNCCGate(decoder_channels, skip_channels, mid_channels, window_size)
+        self.gconv = nn.Conv2d(gch, midc, 1, bias=False)
+        self.xconv = nn.Conv2d(xch, midc, 1, bias=False)
+        self.psi = nn.Conv2d(midc, 1, 1, bias=False)
+        self.cera = CERA(xch)
+        self.swg = SWG(gch, xch, midc, alpha_init=0.1)
 
-    def forward(self, decoder: Tensor, skip: Tensor) -> Tuple[Tensor, Tensor]:
-        enhanced_skip = self.cera(skip)
-        return self.swg(decoder, enhanced_skip)
+    def forward(self, g, x):
+        g1 = self.gconv(g)
+        x1 = self.xconv(x)
+        hint = torch.relu(-g1 * x1)
+        hint = torch.sigmoid(self.psi(hint))
+        x_enh = self.cera(x)
+        x_soft = self.swg(g, x_enh)
+        out = x_soft * hint
+        return (out, (g1, x1))
 
+class NAP_SCAF(nn.Module):
 
-@dataclass
-class NAPSCAFConfig:
-    in_channels: int = 4
-    num_classes: int = 4
-    base_channels: int = 16
-    stages: int = 4
-    ncc_window: int = 5
-    latent_channels: int = 1024
-    pretrained_vae_encoder: bool = False
-    detach_reconstruction: bool = False
-
-
-class NAPSCAF(nn.Module):
-    """Similarity-Aware Calibration Framework.
-
-    The network uses modality-specific encoders, transformer fusion, a NAP branch,
-    and skip-level CERA+SWG calibration.
-    """
-
-    def __init__(self, config: Optional[NAPSCAFConfig] = None, **kwargs) -> None:
+    def __init__(self, inc, outc, midc=16, stages=4, gate_passes: int=2):
         super().__init__()
-        if config is None:
-            config = NAPSCAFConfig(**kwargs)
-        elif kwargs:
-            raise ValueError("Pass either a config object or keyword arguments, not both.")
-        self.config = config
-        self.in_channels = config.in_channels
-        self.num_classes = config.num_classes
-        self.stages = config.stages
-
-        self.nap = NonLocalAdaptivePrior(
-            in_channels=config.in_channels,
-            base_channels=config.base_channels,
-            stages=config.stages,
-            latent_channels=config.latent_channels,
-            pretrained_vae_encoder=config.pretrained_vae_encoder,
-            detach_reconstruction=config.detach_reconstruction,
-        )
-
-        self.modality_stems = nn.ModuleList(
-            [ConvBNAct(1, config.base_channels) for _ in range(config.in_channels)]
-        )
-
-        self.modality_encoders = nn.ModuleList()
-        for _ in range(config.in_channels):
-            layers = nn.ModuleList()
-            channels = config.base_channels
-            for _ in range(config.stages):
-                layers.append(ConvBNAct(channels, channels * 2, stride=2))
-                channels *= 2
-            self.modality_encoders.append(layers)
-
+        assert gate_passes >= 2, '建议 gate_passes>=2，才能体现前后双阶段校准'
+        self.inc, self.stages = (inc, stages)
+        self.gate_passes = gate_passes
+        self.nap_path = NAP_Path(inc, midc, stages)
+        self.inconvs = nn.ModuleList([Conv3x3(1, midc, 1) for _ in range(inc)])
+        self.encs = nn.ModuleList()
+        for _ in range(inc):
+            enc = nn.ModuleList()
+            stagec = midc
+            for _ in range(stages):
+                enc.append(Conv3x3(stagec, stagec * 2, 2))
+                stagec *= 2
+            self.encs.append(enc)
         self.fusion = nn.ModuleList()
-        channels = config.base_channels
-        for _ in range(config.stages):
-            channels *= 2
-            fused_channels = config.in_channels * channels
-            heads = max(1, channels // config.base_channels)
-            self.fusion.append(
-                nn.Sequential(
-                    FusionTransformer(fused_channels, dim_head=config.base_channels, heads=heads),
-                    ConvBNAct(fused_channels, channels, kernel_size=1, padding=0),
-                )
-            )
+        stagec = midc
+        for _ in range(stages):
+            stagec = stagec * 2
+            self.fusion.append(nn.Sequential(Transformer(dim=inc * stagec, dim_head=midc, heads=stagec // midc), Conv3x3(inc * stagec, stagec, 1)))
+        self.dec = nn.ModuleList()
+        self.gates = nn.ModuleList()
+        self.convouts = nn.ModuleList()
+        for k in range(stages):
+            self.dec.append(nn.ModuleList([nn.ConvTranspose2d(stagec, stagec // 2, 2, 2), Conv3x3(stagec, stagec // 2, 1)]))
+            stagec //= 2
+            self.gates.append(SWC_Gate(gch=stagec, xch=stagec, midc=stagec // 2))
+            self.convouts.append(nn.Conv2d(stagec, outc, 1, 1, 0))
 
-        self.decoder = nn.ModuleList()
-        self.prior_align = nn.ModuleList()
-        self.calibration = nn.ModuleList()
-        self.heads = nn.ModuleList()
-
-        decoder_channels = channels
-        for i in range(config.stages):
-            out_channels = decoder_channels // 2
-            self.decoder.append(
-                nn.ModuleDict(
-                    {
-                        "up": nn.ConvTranspose2d(decoder_channels, out_channels, kernel_size=2, stride=2),
-                        "prior_merge": ConvBNAct(out_channels * 2, out_channels),
-                        "skip_merge": ConvBNAct(out_channels * 2, out_channels),
-                    }
-                )
-            )
-            self.prior_align.append(ConvBNAct(out_channels, out_channels, kernel_size=1, padding=0))
-            self.calibration.append(
-                SimilarityCalibrationBlock(
-                    decoder_channels=out_channels,
-                    skip_channels=out_channels,
-                    mid_channels=max(1, out_channels // 2),
-                    window_size=config.ncc_window,
-                )
-            )
-            self.heads.append(nn.Conv2d(out_channels, config.num_classes, kernel_size=1))
-            decoder_channels = out_channels
-
-    def _encode_modalities(self, x: Tensor) -> List[Tensor]:
-        modality_inputs = torch.chunk(x, self.in_channels, dim=1)
-        stacks: List[List[Tensor]] = []
-        for idx, modality in enumerate(modality_inputs):
-            feat = self.modality_stems[idx](modality)
-            feats: List[Tensor] = []
-            for layer in self.modality_encoders[idx]:
-                feat = layer(feat)
-                feats.append(feat)
-            stacks.append(feats)
-
-        fused: List[Tensor] = []
-        for level in range(self.stages):
-            level_feats = [stack[level] for stack in stacks]
-            fused.append(self.fusion[level](torch.cat(level_feats, dim=1)))
-        return fused
-
-    def forward(self, x: Tensor, return_aux: bool = False) -> Union[Tensor, Dict[str, Tensor]]:
-        input_size = x.shape[-2:]
-        if return_aux:
-            prior_feats, aux = self.nap(x, return_aux=True)
-        else:
-            prior_feats = self.nap(x, return_aux=False)
-            aux = {}
-
-        fused = self._encode_modalities(x)
-        feat = fused[-1]
-        gate_maps: List[Tensor] = []
-
-        for i, block in enumerate(self.decoder):
-            feat = block["up"](feat)
-            prior = prior_feats[i]
-            if prior.shape[-2:] != feat.shape[-2:]:
-                prior = F.interpolate(prior, size=feat.shape[-2:], mode="bilinear", align_corners=False)
-            prior = self.prior_align[i](prior)
-            feat = block["prior_merge"](torch.cat([feat, prior], dim=1))
-
-            if i < self.stages - 1:
-                skip = fused[-2 - i]
-                if skip.shape[-2:] != feat.shape[-2:]:
-                    skip = F.interpolate(skip, size=feat.shape[-2:], mode="bilinear", align_corners=False)
-                calibrated_skip, gate = self.calibration[i](feat, skip)
-                feat = block["skip_merge"](torch.cat([feat, calibrated_skip], dim=1))
-                gate_maps.append(gate)
-            else:
-                # Final full-resolution level has no encoder feature at the same scale.
-                gate_maps.append(torch.ones(feat.shape[0], 1, *feat.shape[-2:], device=feat.device, dtype=feat.dtype))
-
-        logits = self.heads[-1](feat)
-        if logits.shape[-2:] != input_size:
-            logits = F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)
-
-        if not return_aux:
-            return logits
-        aux.update({"logits": logits, "gates": gate_maps})
-        return aux
-
-
-def build_nap_scaf(**kwargs) -> NAPSCAF:
-    """Factory function used by scripts."""
-
-    return NAPSCAF(NAPSCAFConfig(**kwargs))
-
-
-if __name__ == "__main__":
-    model = build_nap_scaf(base_channels=8, stages=3, latent_channels=256)
-    x = torch.randn(1, 4, 128, 128)
-    with torch.no_grad():
-        y = model(x)
-    print(tuple(y.shape))
+    def forward(self, x):
+        nap_feats = self.nap_path(x)
+        xin = torch.chunk(x, self.inc, 1)
+        enc_stacks = []
+        for i in range(self.inc):
+            feas = []
+            xi = self.inconvs[i](xin[i])
+            for layer in self.encs[i]:
+                xi = layer(xi)
+                feas.append(xi)
+            enc_stacks.append(feas)
+        fused = []
+        for k in range(self.stages):
+            feas = [feas[k] for feas in enc_stacks]
+            fea = torch.cat(feas, 1)
+            fea = self.fusion[k](fea)
+            fused.append(fea)
+        outs = []
+        fea = fused[-1]
+        for i, (up, merge) in enumerate(self.dec):
+            fea = up(fea)
+            gfeat = nap_feats[i]
+            fea, _ = self.gates[i](gfeat, fea)
+            if i < len(fused) - 1:
+                fea = merge(torch.cat([fea, fused[-2 - i]], 1))
+            for _ in range(self.gate_passes - 1):
+                fea, _ = self.gates[i](gfeat, fea)
+            outs.append(self.convouts[i](fea))
+        return outs[-1]
+if __name__ == '__main__':
+    input_channels = 4
+    output_channels = 4
+    mid_channels = 16
+    stages = 4
+    nap_scaf_model = NAP_SCAF(inc=input_channels, outc=output_channels, midc=mid_channels, stages=stages)
+    batch_size = 16
+    image_height, image_width = (256, 256)
+    input_tensor = torch.randn(batch_size, input_channels, image_height, image_width)
+    output_train = nap_scaf_model(input_tensor)
+    print('Train Segmentation Output Shape:', tuple(output_train.shape))
