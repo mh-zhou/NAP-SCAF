@@ -72,9 +72,6 @@ def total_nap_scaf_loss(
     kl_weight: float = 1e-4,
 ) -> Tensor:
     """Compute the segmentation loss and optional NAP variational losses.
-
-    ``output`` may be either logits or the dictionary returned by
-    ``model(image, return_aux=True)``.
     """
 
     seg_loss = SegmentationLoss(num_classes=num_classes)
